@@ -1,0 +1,792 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:math' as math;
+import 'dart:typed_data';
+
+import 'package:android_intent_plus/android_intent.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_contacts/flutter_contacts.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:flutter_svg/flutter_svg.dart';
+import 'package:flutter_tts/flutter_tts.dart';
+import 'package:http/http.dart' as http;
+import 'package:image_picker/image_picker.dart';
+import 'package:speech_to_text/speech_recognition_result.dart';
+import 'package:speech_to_text/speech_to_text.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
+
+const String botName = 'Zenci';
+const String model = 'claude-sonnet-5-5';
+const _native = MethodChannel('zenci/native');
+
+const _s = {'type': 'string'};
+const _n = {'type': 'integer'};
+Map<String, dynamic> _t(String n, String d, Map<String, dynamic> p, [List<String> r = const []]) =>
+    {'name': n, 'description': d, 'input_schema': {'type': 'object', 'properties': p, 'required': r}};
+
+final List<Map<String, dynamic>> toolDefs = [
+  _t('set_alarm', 'Telefona alarm kurar (24 saat formatı).', {'hour': _n, 'minute': _n, 'message': _s}, ['hour', 'minute']),
+  _t('set_timer', 'Geri sayım zamanlayıcısı kurar.', {'seconds': _n, 'message': _s}, ['seconds']),
+  _t('call_phone', 'Arama ekranını açar. Numara ya da rehberdeki isim ver.', {'number': _s, 'contact_name': _s}),
+  _t('send_sms', 'SMS taslağını hazırlar, kullanıcı gönder der.', {'number': _s, 'contact_name': _s, 'message': _s}, ['message']),
+  _t('open_app', 'Telefondaki bir uygulamayı adıyla açar.', {'name': _s}, ['name']),
+  _t('flashlight', 'El fenerini açar/kapatır.', {'on': {'type': 'boolean'}}, ['on']),
+  _t('open_settings', 'Ayar sayfası açar: wifi, bluetooth, sound, display, airplane, battery, location.', {'page': _s}, ['page']),
+  _t('play_music', 'Müzik aratır. service: youtube veya spotify.', {'query': _s, 'service': _s}, ['query']),
+  _t('add_calendar_event', 'Takvime etkinlik ekleme ekranını açar. Tarihler ISO 8601 yerel saat.', {'title': _s, 'start': _s, 'end': _s, 'description': _s, 'location': _s}, ['title', 'start']),
+  _t('open_url', 'Bir bağlantıyı veya harita aramasını açar.', {'url': _s}, ['url']),
+  _t('get_weather', 'Bir şehrin hava durumunu getirir.', {'city': _s}, ['city']),
+  _t('get_news', 'Güncel haber başlıkları getirir (konu opsiyonel).', {'topic': _s}),
+  _t('remember', 'Kullanıcı hakkında kalıcı bir bilgiyi hafızaya kaydeder.', {'fact': _s}, ['fact']),
+  _t('forget', 'Hafızadan bilgiyi siler.', {'fact': _s}, ['fact']),
+  _t('look_with_camera', 'Kamerayı açıp fotoğraf çektirir ve görüntüyü sana gösterir.', {}),
+  _t('plugin_request', 'Kullanıcının eklentisine (harici API) GET isteği atar. path: temel URL sonrası yol ve sorgu.', {'plugin': _s, 'path': _s}, ['plugin', 'path']),
+];
+
+const _lab = {
+  'set_alarm': 'Alarm kuruldu', 'set_timer': 'Zamanlayıcı kuruldu', 'call_phone': 'Arama ekranı açıldı',
+  'send_sms': 'SMS hazırlandı', 'open_app': 'Uygulama açıldı', 'flashlight': 'El feneri',
+  'open_settings': 'Ayarlar açıldı', 'play_music': 'Müzik açıldı', 'add_calendar_event': 'Takvim açıldı',
+  'open_url': 'Bağlantı açıldı', 'get_weather': 'Hava durumu alındı', 'get_news': 'Haberler alındı',
+  'remember': 'Hafızaya kaydedildi', 'forget': 'Hafızadan silindi', 'look_with_camera': 'Kamera kullanıldı',
+  'plugin_request': 'Eklenti sorgulandı',
+};
+
+void main() => runApp(const App());
+
+class App extends StatelessWidget {
+  const App({super.key});
+  @override
+  Widget build(BuildContext context) => MaterialApp(
+        title: botName,
+        debugShowCheckedModeBanner: false,
+        theme: ThemeData.dark(useMaterial3: true).copyWith(
+          scaffoldBackgroundColor: Colors.black,
+          colorScheme: const ColorScheme.dark(primary: Colors.white, surface: Colors.black),
+        ),
+        home: const Home(),
+      );
+}
+
+class Msg {
+  final String role; // user | assistant | tool
+  final String text;
+  final Uint8List? img;
+  Msg(this.role, this.text, {this.img});
+}
+
+class Home extends StatefulWidget {
+  const Home({super.key});
+  @override
+  State<Home> createState() => _HomeState();
+}
+
+class _HomeState extends State<Home> with WidgetsBindingObserver, SingleTickerProviderStateMixin {
+  final _stt = SpeechToText();
+  final _tts = FlutterTts();
+  final _store = const FlutterSecureStorage();
+  final _picker = ImagePicker();
+  final _input = TextEditingController();
+  final _focus = FocusNode();
+  final _scroll = ScrollController();
+  late final AnimationController _ctrl;
+
+  final List<Msg> _msgs = [Msg('assistant', 'Hazırım. “Lan $botName” de ya da yaz.')];
+  final List<Map<String, dynamic>> _api = [];
+  List<String> _facts = [];
+  List<Map<String, dynamic>> _plugins = [];
+  String? _key;
+  bool _sttOk = false, _busy = false, _speaking = false, _loopOn = false, _useSearch = true;
+  DateTime? _awakeUntil;
+  String _partial = '';
+  Timer? _watchdog;
+
+  final _wake = RegExp(r'(?:^|\s)(?:lan|ulan|len|hey|ey)\s+(?:zenci|zenç[iı]|zenc[iı]|senci)[\s,.!?]*(.*)$', dotAll: true);
+  final _wake2 = RegExp(r'^zenci[\s,.!?]+(.*)$', dotAll: true);
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _ctrl = AnimationController(vsync: this, duration: const Duration(seconds: 8))..repeat();
+    _boot();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _watchdog?.cancel();
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState s) {
+    if (s == AppLifecycleState.resumed) {
+      _loopOn = true;
+    } else if (s == AppLifecycleState.paused) {
+      _loopOn = false;
+      _stt.stop();
+    }
+  }
+
+  Future<void> _boot() async {
+    _key = await _store.read(key: 'k');
+    _facts = List<String>.from(jsonDecode(await _store.read(key: 'facts') ?? '[]'));
+    _plugins = List<Map<String, dynamic>>.from(jsonDecode(await _store.read(key: 'plugins') ?? '[]'));
+    await _tts.setLanguage('tr-TR');
+    await _tts.setSpeechRate(0.5);
+    await _tts.awaitSpeakCompletion(true);
+    _sttOk = await _stt.initialize(
+      onStatus: (s) {
+        if (s == 'done' || s == 'notListening') _kick();
+      },
+      onError: (_) => _kick(),
+    );
+    await WakelockPlus.enable();
+    if (mounted) setState(() {});
+    if (_key == null) await _askKey();
+    _loopOn = true;
+    _watchdog = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (mounted) setState(() {});
+      _kick();
+    });
+  }
+
+  void _kick() {
+    if (_loopOn && _sttOk && !_busy && !_speaking && !_stt.isListening) _startListening();
+  }
+
+  Future<void> _startListening() async {
+    try {
+      await _stt.listen(
+        onResult: _onResult,
+        localeId: 'tr_TR',
+        listenFor: const Duration(seconds: 50),
+        pauseFor: const Duration(seconds: 4),
+        listenOptions: SpeechListenOptions(partialResults: true, cancelOnError: false, listenMode: ListenMode.dictation),
+      );
+    } catch (_) {}
+  }
+
+  void _onResult(SpeechRecognitionResult r) {
+    if (!mounted) return;
+    setState(() => _partial = r.finalResult ? '' : r.recognizedWords);
+    if (r.finalResult && r.recognizedWords.trim().isNotEmpty) _heard(r.recognizedWords);
+  }
+
+  String _norm(String s) => s.replaceAll('İ', 'i').replaceAll('I', 'ı').toLowerCase();
+
+  Future<void> _heard(String orig) async {
+    if (_busy || _speaking) return;
+    final n = _norm(orig);
+    final awake = _awakeUntil != null && DateTime.now().isBefore(_awakeUntil!);
+    String? cmd;
+    final m = _wake.firstMatch(n) ?? _wake2.firstMatch(n);
+    if (m != null) {
+      cmd = orig.substring(m.start(1)).trim();
+    } else if (awake) {
+      cmd = orig.trim();
+    }
+    if (cmd == null) return;
+    if (cmd.length < 3) {
+      _awakeUntil = DateTime.now().add(const Duration(seconds: 12));
+      await _say('Buyur');
+      return;
+    }
+    _awakeUntil = null;
+    await _ask(cmd, voice: true);
+  }
+
+  Future<void> _say(String t) async {
+    _speaking = true;
+    if (mounted) setState(() {});
+    try {
+      await _stt.stop();
+      await _tts.speak(t);
+    } catch (_) {}
+    await Future.delayed(const Duration(milliseconds: 300));
+    _speaking = false;
+    if (mounted) setState(() {});
+  }
+
+  String _spoken(String t) {
+    var s = t.replaceAll(RegExp(r'```[\s\S]*?```'), ' Kodu ekrana yazdım. ').replaceAll(RegExp(r'[*#_`>]'), '');
+    return s.length > 700 ? s.substring(0, 700) : s;
+  }
+
+  Future<void> _askKey() async {
+    final c = TextEditingController();
+    final k = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF0C0C0C),
+        title: const Text('Anthropic API anahtarı'),
+        content: TextField(controller: c, obscureText: true, decoration: const InputDecoration(hintText: 'sk-ant-...')),
+        actions: [TextButton(onPressed: () => Navigator.pop(ctx, c.text.trim()), child: const Text('Kaydet'))],
+      ),
+    );
+    if (k != null && k.isNotEmpty) {
+      await _store.write(key: 'k', value: k);
+      _key = k;
+    }
+  }
+
+  // ---------- Claude ----------
+  String _system(bool voice) => '''Sen $botName, kullanıcının Android telefonundaki kişisel yapay zeka asistanısın (Jarvis tarzı: zeki, hızlı, hafif esprili, Türkçe).
+Şu an: ${DateTime.now().toIso8601String()} (yerel saat).
+- ${voice ? 'Kullanıcı sesle konuşuyor, cevabın sesli okunacak: en fazla 2-3 kısa cümle, liste ve markdown kullanma.' : 'Cevapları net ve öz tut.'}
+- Kod isteyince tam çalışan kodu ```dil bloğu içinde yaz.
+- Basit görsel, logo veya çizim istenince geçerli ve kendi içinde tam bir SVG'yi ```svg bloğu içinde yaz (viewBox ver, arka plan ekle).
+- Telefon işleri için araçları kullan, sonucu kısaca söyle. Arama ve SMS ekranı açılır, kullanıcı kendisi onaylar.
+- Güncel bilgi için web_search, mağaza/iş takibi için eklentileri (plugin_request) kullan. Eklentiler sadece okur. Sayıları kendin hesapla, rakamlarla özetle.
+- Kullanıcı kalıcı bir şey söylerse (isim, tercih, önemli bilgi) remember ile kaydet.
+Hafıza: ${_facts.isEmpty ? '(boş)' : _facts.join('; ')}
+Eklentiler: ${_plugins.isEmpty ? '(yok)' : _plugins.map((p) => '${p['name']} (${p['note']})').join('; ')}''';
+
+  List<Map<String, dynamic>> _trimmed() {
+    if (_api.length <= 30) return _api;
+    var s = _api.length - 30;
+    while (s < _api.length) {
+      final m = _api[s];
+      final c = m['content'];
+      if (m['role'] == 'user' && (c is String || (c is List && !c.any((b) => b is Map && b['type'] == 'tool_result')))) break;
+      s++;
+    }
+    return _api.sublist(s);
+  }
+
+  Future<Map<String, dynamic>> _call(bool voice) async {
+    final body = {
+      'model': model,
+      'max_tokens': 4096,
+      'system': _system(voice),
+      'messages': _trimmed(),
+      'tools': [
+        ...toolDefs,
+        if (_useSearch) {'type': 'web_search_20250305', 'name': 'web_search', 'max_uses': 3},
+      ],
+    };
+    final res = await http.post(
+      Uri.parse('https://api.anthropic.com/v1/messages'),
+      headers: {'x-api-key': _key!, 'anthropic-version': '2023-06-01', 'content-type': 'application/json'},
+      body: jsonEncode(body),
+    );
+    final d = jsonDecode(utf8.decode(res.bodyBytes));
+    if (res.statusCode != 200) {
+      if (_useSearch && res.body.contains('web_search')) {
+        _useSearch = false;
+        return _call(voice);
+      }
+      throw (d['error']?['message'] ?? res.body);
+    }
+    return d;
+  }
+
+  Future<String> _loop(bool voice) async {
+    for (var i = 0; i < 8; i++) {
+      final data = await _call(voice);
+      final blocks = List<Map<String, dynamic>>.from(data['content'] as List);
+      _api.add({'role': 'assistant', 'content': blocks});
+      final text = blocks.where((b) => b['type'] == 'text').map((b) => b['text']).join('\n').trim();
+      final stop = data['stop_reason'];
+      if (stop == 'tool_use') {
+        final results = <Map<String, dynamic>>[];
+        for (final b in blocks.where((b) => b['type'] == 'tool_use')) {
+          dynamic out;
+          try {
+            out = await _runTool(b['name'], Map<String, dynamic>.from(b['input'] as Map));
+          } catch (e) {
+            out = 'Hata: $e';
+          }
+          if (mounted) setState(() => _msgs.add(Msg('tool', _lab[b['name']] ?? b['name'])));
+          results.add({'type': 'tool_result', 'tool_use_id': b['id'], 'content': out});
+        }
+        _api.add({'role': 'user', 'content': results});
+        _scrollDown();
+        continue;
+      }
+      if (stop == 'pause_turn') continue;
+      return text.isEmpty ? 'Tamam.' : text;
+    }
+    return 'Bu iş çok uzadı, yarıda kestim.';
+  }
+
+  Future<void> _ask(String text, {required bool voice, Uint8List? img}) async {
+    if (_key == null) {
+      await _askKey();
+      if (_key == null) return;
+    }
+    if (_busy) return;
+    setState(() {
+      _busy = true;
+      _msgs.add(Msg('user', text, img: img));
+    });
+    _scrollDown();
+    _api.add({
+      'role': 'user',
+      'content': img == null
+          ? text
+          : [
+              {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg', 'data': base64Encode(img)}},
+              {'type': 'text', 'text': text},
+            ],
+    });
+    String reply;
+    try {
+      reply = await _loop(voice);
+    } catch (e) {
+      reply = 'Bir hata oluştu: $e';
+    }
+    if (mounted) setState(() => _msgs.add(Msg('assistant', reply)));
+    _scrollDown();
+    if (voice) await _say(_spoken(reply));
+    if (mounted) setState(() => _busy = false);
+  }
+
+  // ---------- Araçlar ----------
+  Future<String?> _number(Map i) async {
+    final n = i['number']?.toString();
+    if (n != null && n.isNotEmpty) return n;
+    final q = _norm(i['contact_name']?.toString() ?? '');
+    if (q.isEmpty || !await FlutterContacts.requestPermission(readonly: true)) return null;
+    final cs = await FlutterContacts.getContacts(withProperties: true);
+    for (final c in cs) {
+      if (_norm(c.displayName).contains(q) && c.phones.isNotEmpty) return c.phones.first.number;
+    }
+    return null;
+  }
+
+  Future<dynamic> _runTool(String name, Map<String, dynamic> i) async {
+    switch (name) {
+      case 'set_alarm':
+        await AndroidIntent(action: 'android.intent.action.SET_ALARM', arguments: {
+          'android.intent.extra.alarm.HOUR': i['hour'],
+          'android.intent.extra.alarm.MINUTES': i['minute'],
+          'android.intent.extra.alarm.MESSAGE': i['message'] ?? botName,
+          'android.intent.extra.alarm.SKIP_UI': true,
+        }).launch();
+        return 'Alarm kuruldu: ${i['hour']}:${i['minute'].toString().padLeft(2, '0')}';
+      case 'set_timer':
+        await AndroidIntent(action: 'android.intent.action.SET_TIMER', arguments: {
+          'android.intent.extra.alarm.LENGTH': i['seconds'],
+          'android.intent.extra.alarm.MESSAGE': i['message'] ?? botName,
+          'android.intent.extra.alarm.SKIP_UI': true,
+        }).launch();
+        return 'Zamanlayıcı kuruldu: ${i['seconds']} sn';
+      case 'call_phone':
+        {
+          final n = await _number(i);
+          if (n == null) return 'Numara bulunamadı.';
+          await launchUrl(Uri.parse('tel:$n'));
+          return 'Arama ekranı açıldı: $n';
+        }
+      case 'send_sms':
+        {
+          final n = await _number(i);
+          if (n == null) return 'Numara bulunamadı.';
+          await launchUrl(Uri.parse('sms:$n?body=${Uri.encodeComponent(i['message'].toString())}'));
+          return 'SMS taslağı $n için hazır, kullanıcı göndermeli.';
+        }
+      case 'open_app':
+        {
+          final q = _norm(i['name'].toString());
+          final apps = await _native.invokeMethod('listApps') as List;
+          for (final a in apps) {
+            if (_norm(a['name'].toString()).contains(q)) {
+              await _native.invokeMethod('launch', a['pkg']);
+              return '${a['name']} açıldı';
+            }
+          }
+          return 'Böyle bir uygulama bulunamadı.';
+        }
+      case 'flashlight':
+        await _native.invokeMethod('torch', i['on'] == true);
+        return 'Tamam';
+      case 'open_settings':
+        {
+          const acts = {
+            'wifi': 'android.settings.WIFI_SETTINGS', 'bluetooth': 'android.settings.BLUETOOTH_SETTINGS',
+            'sound': 'android.settings.SOUND_SETTINGS', 'display': 'android.settings.DISPLAY_SETTINGS',
+            'airplane': 'android.settings.AIRPLANE_MODE_SETTINGS', 'battery': 'android.settings.BATTERY_SAVER_SETTINGS',
+            'location': 'android.settings.LOCATION_SOURCE_SETTINGS',
+          };
+          await AndroidIntent(action: acts[i['page']] ?? 'android.settings.SETTINGS').launch();
+          return 'Ayarlar açıldı';
+        }
+      case 'play_music':
+        {
+          final q = Uri.encodeComponent(i['query'].toString());
+          final u = i['service'] == 'spotify' ? 'https://open.spotify.com/search/$q' : 'https://music.youtube.com/search?q=$q';
+          await launchUrl(Uri.parse(u), mode: LaunchMode.externalApplication);
+          return 'Müzik araması açıldı';
+        }
+      case 'add_calendar_event':
+        {
+          final st = DateTime.parse(i['start'].toString());
+          final en = i['end'] != null ? DateTime.parse(i['end'].toString()) : st.add(const Duration(hours: 1));
+          await AndroidIntent(action: 'android.intent.action.INSERT', data: 'content://com.android.calendar/events', arguments: {
+            'title': i['title'],
+            'beginTime': st.millisecondsSinceEpoch,
+            'endTime': en.millisecondsSinceEpoch,
+            'description': i['description'] ?? '',
+            'eventLocation': i['location'] ?? '',
+          }).launch();
+          return 'Takvim ekranı açıldı, kullanıcı kaydetmeli.';
+        }
+      case 'open_url':
+        await launchUrl(Uri.parse(i['url'].toString()), mode: LaunchMode.externalApplication);
+        return 'Açıldı';
+      case 'get_weather':
+        {
+          final g = jsonDecode(utf8.decode((await http.get(Uri.parse(
+                  'https://geocoding-api.open-meteo.com/v1/search?count=1&language=tr&name=${Uri.encodeComponent(i['city'].toString())}')))
+              .bodyBytes));
+          final l = g['results'] as List?;
+          if (l == null || l.isEmpty) return 'Şehir bulunamadı';
+          final r = l.first;
+          final w = await http.get(Uri.parse(
+              'https://api.open-meteo.com/v1/forecast?latitude=${r['latitude']}&longitude=${r['longitude']}&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max&forecast_days=3&timezone=auto'));
+          return '${r['name']} (weather_code WMO kodudur): ${w.body}';
+        }
+      case 'get_news':
+        {
+          final q = (i['topic'] ?? '').toString();
+          final u = q.isEmpty
+              ? 'https://news.google.com/rss?hl=tr&gl=TR&ceid=TR:tr'
+              : 'https://news.google.com/rss/search?q=${Uri.encodeComponent(q)}&hl=tr&gl=TR&ceid=TR:tr';
+          final b = utf8.decode((await http.get(Uri.parse(u))).bodyBytes);
+          final t = RegExp(r'<item>\s*<title>(.*?)</title>', dotAll: true)
+              .allMatches(b)
+              .take(10)
+              .map((m) => m.group(1)!.replaceAll('<![CDATA[', '').replaceAll(']]>', '').replaceAll('&amp;', '&').replaceAll('&quot;', '"').replaceAll('&#39;', "'"))
+              .toList();
+          return t.isEmpty ? 'Haber bulunamadı' : t.join('\n');
+        }
+      case 'remember':
+        _facts.add(i['fact'].toString());
+        await _store.write(key: 'facts', value: jsonEncode(_facts));
+        return 'Kaydedildi';
+      case 'forget':
+        {
+          final q = _norm(i['fact'].toString());
+          _facts.removeWhere((f) => _norm(f).contains(q));
+          await _store.write(key: 'facts', value: jsonEncode(_facts));
+          return 'Silindi';
+        }
+      case 'look_with_camera':
+        {
+          final b = await _shoot();
+          if (b == null) return 'Fotoğraf çekilmedi.';
+          return [
+            {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg', 'data': base64Encode(b)}},
+            {'type': 'text', 'text': 'Kullanıcının çektiği fotoğraf.'},
+          ];
+        }
+      case 'plugin_request':
+        {
+          final p = _plugins.firstWhere((e) => e['name'].toString().toLowerCase() == i['plugin'].toString().toLowerCase(),
+              orElse: () => <String, dynamic>{});
+          if (p.isEmpty) return 'Böyle bir eklenti yok.';
+          final url = '${(p['url'] as String).replaceAll(RegExp(r'/+$'), '')}/${i['path'].toString().replaceFirst(RegExp(r'^/+'), '')}';
+          final hn = (p['hname'] ?? '').toString();
+          final r = await http.get(Uri.parse(url), headers: {'Accept': 'application/json', if (hn.isNotEmpty) hn: (p['hvalue'] ?? '').toString()});
+          final body = utf8.decode(r.bodyBytes);
+          return 'HTTP ${r.statusCode}\n${body.length > 12000 ? body.substring(0, 12000) : body}';
+        }
+    }
+    return 'Bilinmeyen araç';
+  }
+
+  Future<Uint8List?> _shoot() async {
+    final x = await _picker.pickImage(source: ImageSource.camera, maxWidth: 1280, imageQuality: 70);
+    return x == null ? null : await x.readAsBytes();
+  }
+
+  Future<void> _photoButton() async {
+    final b = await _shoot();
+    if (b == null) return;
+    final t = _input.text.trim();
+    _input.clear();
+    await _ask(t.isEmpty ? 'Bu ne? Kısaca anlat.' : t, voice: false, img: b);
+  }
+
+  // ---------- Eklentiler / ayarlar ----------
+  Future<void> _addPlugin() async {
+    final c = List.generate(5, (_) => TextEditingController());
+    const hints = [
+      'Ad (örn: magaza)',
+      'Temel URL (https://...)',
+      'Header adı (örn: Authorization)',
+      'Header değeri (örn: Bearer xxx)',
+      'Not: bu API ne işe yarar, endpoint örnekleri',
+    ];
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF0C0C0C),
+        title: const Text('Eklenti ekle'),
+        content: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            for (var k = 0; k < 5; k++) TextField(controller: c[k], maxLines: k == 4 ? 3 : 1, decoration: InputDecoration(hintText: hints[k])),
+          ]),
+        ),
+        actions: [TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Kaydet'))],
+      ),
+    );
+    if (ok == true && c[0].text.trim().isNotEmpty && c[1].text.trim().isNotEmpty) {
+      _plugins.add({
+        'name': c[0].text.trim(), 'url': c[1].text.trim(), 'hname': c[2].text.trim(),
+        'hvalue': c[3].text.trim(), 'note': c[4].text.trim(),
+      });
+      await _store.write(key: 'plugins', value: jsonEncode(_plugins));
+    }
+  }
+
+  void _settings() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF0A0A0A),
+      isScrollControlled: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, set) => SafeArea(
+          child: ListView(shrinkWrap: true, children: [
+            ListTile(leading: const Icon(Icons.key), title: const Text('API anahtarı'), onTap: _askKey),
+            for (final p in List.of(_plugins))
+              ListTile(
+                leading: const Icon(Icons.extension_outlined),
+                title: Text(p['name'].toString()),
+                subtitle: Text((p['note'] ?? '').toString(), maxLines: 1, overflow: TextOverflow.ellipsis),
+                trailing: IconButton(
+                  icon: const Icon(Icons.delete_outline),
+                  onPressed: () async {
+                    _plugins.remove(p);
+                    await _store.write(key: 'plugins', value: jsonEncode(_plugins));
+                    set(() {});
+                  },
+                ),
+              ),
+            ListTile(
+              leading: const Icon(Icons.add),
+              title: const Text('Eklenti ekle'),
+              onTap: () async {
+                await _addPlugin();
+                set(() {});
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.memory),
+              title: Text('Hafızayı sil (${_facts.length} kayıt)'),
+              onTap: () async {
+                _facts.clear();
+                await _store.write(key: 'facts', value: '[]');
+                set(() {});
+              },
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  // ---------- Arayüz ----------
+  void _scrollDown() => WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (_scroll.hasClients) {
+          _scroll.animateTo(_scroll.position.maxScrollExtent + 200, duration: const Duration(milliseconds: 250), curve: Curves.easeOut);
+        }
+      });
+
+  void _submit(String v) {
+    final t = v.trim();
+    _input.clear();
+    _focus.requestFocus();
+    if (t.isNotEmpty) _ask(t, voice: false);
+  }
+
+  Widget _code(String lang, String code) => Container(
+        margin: const EdgeInsets.symmetric(vertical: 6),
+        decoration: BoxDecoration(color: const Color(0xFF050505), borderRadius: BorderRadius.circular(12), border: Border.all(color: Colors.white12)),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Padding(
+            padding: const EdgeInsets.only(left: 12),
+            child: Row(children: [
+              Text(lang.isEmpty ? 'kod' : lang, style: const TextStyle(color: Colors.white54, fontSize: 12)),
+              const Spacer(),
+              IconButton(
+                visualDensity: VisualDensity.compact,
+                icon: const Icon(Icons.copy, size: 16, color: Colors.white54),
+                onPressed: () {
+                  Clipboard.setData(ClipboardData(text: code));
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Kopyalandı'), duration: Duration(seconds: 1)));
+                },
+              ),
+            ]),
+          ),
+          if (lang == 'svg')
+            Container(
+              margin: const EdgeInsets.fromLTRB(8, 0, 8, 8),
+              decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(8)),
+              child: SvgPicture.string(code, height: 240),
+            )
+          else
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+              child: SelectableText(code, style: const TextStyle(fontFamily: 'monospace', fontSize: 12.5, height: 1.4)),
+            ),
+        ]),
+      );
+
+  List<Widget> _parts(String t) {
+    final out = <Widget>[];
+    var last = 0;
+    for (final m in RegExp(r'```(\w*)\n?([\s\S]*?)```').allMatches(t)) {
+      final before = t.substring(last, m.start).trim();
+      if (before.isNotEmpty) out.add(SelectableText(before, style: const TextStyle(height: 1.45)));
+      out.add(_code(m.group(1) ?? '', (m.group(2) ?? '').trimRight()));
+      last = m.end;
+    }
+    final rest = t.substring(last).trim();
+    if (rest.isNotEmpty) out.add(SelectableText(rest, style: const TextStyle(height: 1.45)));
+    return out;
+  }
+
+  Widget _bubble(Msg m) {
+    if (m.role == 'tool') {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 3),
+        child: Row(children: [
+          const Icon(Icons.bolt, size: 14, color: Colors.white38),
+          const SizedBox(width: 4),
+          Text(m.text, style: const TextStyle(color: Colors.white38, fontSize: 12)),
+        ]),
+      );
+    }
+    final user = m.role == 'user';
+    final w = MediaQuery.of(context).size.width * 0.84;
+    return Align(
+      alignment: user ? Alignment.centerRight : Alignment.centerLeft,
+      child: Container(
+        margin: const EdgeInsets.symmetric(vertical: 5),
+        padding: const EdgeInsets.all(13),
+        constraints: BoxConstraints(maxWidth: w),
+        decoration: BoxDecoration(
+          color: user ? Colors.white : const Color(0xFF0B0B0B),
+          borderRadius: BorderRadius.only(
+            topLeft: const Radius.circular(20), topRight: const Radius.circular(20),
+            bottomLeft: Radius.circular(user ? 20 : 4), bottomRight: Radius.circular(user ? 4 : 20),
+          ),
+          border: user ? null : Border.all(color: Colors.white12),
+        ),
+        child: user
+            ? Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                if (m.img != null) Padding(padding: const EdgeInsets.only(bottom: 8), child: ClipRRect(borderRadius: BorderRadius.circular(10), child: Image.memory(m.img!, height: 160))),
+                Text(m.text, style: const TextStyle(color: Colors.black, height: 1.4, fontWeight: FontWeight.w500)),
+              ])
+            : Column(crossAxisAlignment: CrossAxisAlignment.start, children: _parts(m.text)),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final awake = _awakeUntil != null && DateTime.now().isBefore(_awakeUntil!);
+    final amp = _speaking ? 0.30 : _busy ? 0.24 : awake ? 0.20 : 0.09;
+    final speed = _speaking ? 6 : _busy ? 8 : awake ? 4 : 2;
+    final status = _partial.isNotEmpty
+        ? _partial
+        : _speaking ? 'Konuşuyor…' : _busy ? 'Düşünüyor…' : awake ? 'Dinliyorum…' : _sttOk ? '“Lan $botName” de' : 'Mikrofon izni yok';
+    return Scaffold(
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: RadialGradient(center: Alignment(0, -0.85), radius: 1.1, colors: [Color(0xFF1A1A1A), Colors.black]),
+        ),
+        child: SafeArea(
+          child: Column(children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 6, 8, 0),
+              child: Row(children: [
+                Text(botName.toUpperCase(), style: const TextStyle(letterSpacing: 8, fontWeight: FontWeight.w300, fontSize: 15)),
+                const Spacer(),
+                IconButton(icon: const Icon(Icons.tune, color: Colors.white70), onPressed: _settings),
+              ]),
+            ),
+            SizedBox(height: 150, width: 150, child: CustomPaint(painter: _Orb(_ctrl, amp, speed))),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 4),
+              child: Text(status, maxLines: 2, overflow: TextOverflow.ellipsis, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white54, fontSize: 13, letterSpacing: 1)),
+            ),
+            Expanded(
+              child: ListView.builder(
+                controller: _scroll,
+                padding: const EdgeInsets.fromLTRB(14, 8, 14, 8),
+                itemCount: _msgs.length,
+                itemBuilder: (_, i) => _bubble(_msgs[i]),
+              ),
+            ),
+            Container(
+              margin: const EdgeInsets.fromLTRB(12, 4, 12, 12),
+              padding: const EdgeInsets.symmetric(horizontal: 6),
+              decoration: BoxDecoration(color: const Color(0xFF0C0C0C), borderRadius: BorderRadius.circular(30), border: Border.all(color: Colors.white12)),
+              child: Row(children: [
+                IconButton(icon: const Icon(Icons.photo_camera_outlined, color: Colors.white60), onPressed: _photoButton),
+                Expanded(
+                  child: TextField(
+                    controller: _input,
+                    focusNode: _focus,
+                    textInputAction: TextInputAction.send,
+                    onSubmitted: _submit,
+                    decoration: const InputDecoration(border: InputBorder.none, hintText: 'Zenci’ye yaz…', hintStyle: TextStyle(color: Colors.white30)),
+                  ),
+                ),
+              ]),
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
+class _Orb extends CustomPainter {
+  final Animation<double> a;
+  final double amp;
+  final int speed;
+  _Orb(this.a, this.amp, this.speed) : super(repaint: a);
+
+  @override
+  void paint(Canvas c, Size s) {
+    final t = a.value * 2 * math.pi * speed;
+    final ctr = Offset(s.width / 2, s.height / 2);
+    final r = s.width * 0.30;
+    final path = Path();
+    for (var k = 0; k <= 96; k++) {
+      final th = k / 96 * 2 * math.pi;
+      final rr = r * (1 + amp * (0.55 * math.sin(3 * th + t) + 0.35 * math.sin(5 * th - 1.7 * t) + 0.25 * math.sin(7 * th + 2.1 * t)));
+      final p = ctr + Offset(rr * math.cos(th), rr * math.sin(th));
+      if (k == 0) {
+        path.moveTo(p.dx, p.dy);
+      } else {
+        path.lineTo(p.dx, p.dy);
+      }
+    }
+    path.close();
+    c.drawPath(path, Paint()..color = Colors.white.withOpacity(0.30)..maskFilter = const MaskFilter.blur(BlurStyle.normal, 24));
+    c.drawPath(
+      path,
+      Paint()..shader = const RadialGradient(colors: [Colors.white, Color(0xFFA8A8A8)]).createShader(Rect.fromCircle(center: ctr, radius: r * 1.3)),
+    );
+    for (final d in [-1.0, 1.0]) {
+      c.save();
+      c.translate(ctr.dx + d * r * 0.38, ctr.dy - r * 0.08);
+      c.rotate(d * -0.5);
+      c.drawOval(Rect.fromCenter(center: Offset.zero, width: r * 0.34, height: r * 0.62), Paint()..color = Colors.black);
+      c.restore();
+    }
+  }
+
+  @override
+  bool shouldRepaint(_Orb o) => o.amp != amp || o.speed != speed;
+}
